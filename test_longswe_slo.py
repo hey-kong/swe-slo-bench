@@ -52,7 +52,7 @@ def options(output_dir='unused', **overrides):
         output_dir=output_dir, base_url='http://unused', output_len=8,
         request_timeout=300, min_completed=1, ttft_slo=10, tps_slo=15,
         budget_seconds=10, probe_seconds=4, confirm_seconds=3,
-        start_concurrency=8, max_concurrency=64, label='test',
+        start_concurrency=8, max_concurrency=64, label='test', confirm_requests=100,
         keep_cache=False, seed=42, allow_prefix_reuse=False,
     )
     values.update(overrides)
@@ -141,14 +141,16 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         async def stage(session, args, prompts, c, seconds, kind, raw, run_id,
-                        deadline, benchmark_start=None):
+                        deadline, benchmark_start=None, request_limit=None):
             calls.append((kind, c, seconds))
             if kind == 'probe':
                 clock.advance(8)  # Four seconds sending, four draining.
             else:
                 self.assertEqual(seconds, 2)
+                self.assertEqual(request_limit, 100)
                 clock.advance(seconds + 2)  # Drain ends after the global deadline.
             return dict(kind=kind, concurrency=c, status='PASS',
+                        completed=request_limit or 1,
                         last_request_started_elapsed_s=clock.read()-2.1)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,10 +168,11 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         kinds = []
 
         async def stage(session, args, prompts, c, seconds, kind, raw, run_id,
-                        deadline, benchmark_start=None):
+                        deadline, benchmark_start=None, request_limit=None):
             kinds.append(kind)
             clock.advance(5 if kind == 'probe' else seconds)
             return dict(kind=kind, concurrency=c,
+                        completed=request_limit or 1,
                         status='INSUFFICIENT' if kind == 'probe' else 'PASS',
                         last_request_started_elapsed_s=clock.read()-.1)
 
@@ -187,11 +190,12 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         outcomes = {8: 'FAIL', 4: 'PASS', 6: 'PASS', 7: 'FAIL'}
 
         async def stage(session, args, prompts, c, seconds, kind, raw, run_id,
-                        deadline, benchmark_start=None):
+                        deadline, benchmark_start=None, request_limit=None):
             if kind == 'probe':
                 probes.append(c)
             clock.advance(seconds)
             return dict(kind=kind, concurrency=c, status=outcomes[c],
+                        completed=request_limit or 1,
                         last_request_started_elapsed_s=clock.read()-.1)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,9 +211,10 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         clock = Clock()
 
         async def stage(session, args, prompts, c, seconds, kind, raw, run_id,
-                        deadline, benchmark_start=None):
+                        deadline, benchmark_start=None, request_limit=None):
             clock.advance(seconds)
             return dict(kind=kind, concurrency=c,
+                        completed=request_limit or 1,
                         status='PASS' if kind == 'probe' else 'FAIL',
                         last_request_started_elapsed_s=clock.read()-.1)
 
@@ -225,7 +230,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         kinds = []
 
         async def stage(session, args, prompts, c, seconds, kind, raw, run_id,
-                        deadline, benchmark_start=None):
+                        deadline, benchmark_start=None, request_limit=None):
             kinds.append(kind)
             clock.advance(1)
             return dict(kind=kind, concurrency=c, status='ERROR',
@@ -346,3 +351,4 @@ class CacheFlushTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

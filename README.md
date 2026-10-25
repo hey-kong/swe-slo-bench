@@ -33,7 +33,8 @@ python longswe_slo.py \
 # Start the target server separately, then benchmark it.
 python longswe_slo.py \
   --dataset "$DATASET" --tokenizer "$TOKENIZER" --base-url "$BASE_URL" \
-  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR"
+  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR" \
+  --confirm-requests 100 --budget-seconds 1200
 ```
 
 Local inputs can be a `save_to_disk` dataset, a Parquet/JSON/JSONL file, or a downloaded dataset directory with split files such as `data/test-*.parquet`. Directory loading selects only `--split test` by default, never train/dev shards. The server URL must include its scheme, host, and port.
@@ -56,7 +57,8 @@ python swebench_slo.py \
 
 python swebench_slo.py \
   --dataset "$DATASET" --tokenizer "$TOKENIZER" --base-url "$BASE_URL" \
-  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR"
+  --label "$LABEL" --output-len 1024 --output-dir "$OUTPUT_DIR" \
+  --confirm-requests 100 --budget-seconds 1200
 ```
 
 For the approximately 40K workload, use a locally downloaded [SWE-bench_bm25_40K](https://huggingface.co/datasets/princeton-nlp/SWE-bench_bm25_40K): its `text` column already includes the issue and retrieved code. Its 40K limit concerns code context under the source tokenizer; actual full-prompt lengths vary with the serving tokenizer.
@@ -67,8 +69,10 @@ Keep SWE-Bench and LongSWE-Bench results in separate output directories. `--insp
 
 ## Test settings
 
-- A 1,200-second request-send window starts after local data preparation and warmup. No new generation requests are initiated after the deadline. Already-sent requests finish normally afterward, so total wall time can exceed 20 minutes.
-- Concurrency starts at 8 and is capped at 64. Doubling and binary search use 180-second probes; `--confirm-seconds` reserves a target confirmation window, not a required minimum. Any remaining send time is used for confirmation, or to continue the last candidate if no probe passed.
+- Search uses fixed-time probes; final confirmation targets the same **100 requests** by default (`--confirm-requests`). Every stage starts from the same seeded prompt order, so complete confirmations use the same source samples across configurations. This target applies to the final confirmation/continuation stage, not each search probe or the whole run.
+- A **1,200-second maximum global send window** starts after local data preparation and warmup. Search, cache flushes, inter-stage draining, and confirmation share this budget. Confirmation stops admitting when it reaches 100 requests or the global deadline, whichever comes first. All admitted requests drain normally; wall time can exceed 20 minutes. A complete confirmation may finish earlier than 20 minutes.
+- Concurrency starts at 8 and is capped at 64. Doubling and binary search use 180-second probes; `--confirm-seconds` reserves a target amount of remaining time, not an extra window or required minimum. If no probe passed, the final stage continues the last candidate with the same request target.
+- Confirmation requires all target requests to complete successfully and meet the SLO; a partial workload is `INSUFFICIENT` even if its observed metrics pass. Errors remain `ERROR` and are not replaced with extra requests. `--min-completed` (default 20) is a sample gate, not a request-count stopping rule; `--confirm-requests` must be at least this value.
 - Requests drain completely between stages without resetting the global clock. Errors stop the run early; existing per-request timeouts still apply. The former `--drain-reserve` option has been removed.
 - Fixed output length, temperature 0, and EOS ignored. Keep output length identical across configurations.
 - Mean decode TPS is the arithmetic mean of `(output_tokens - 1) / (E2E - TTFT)` per request, excluding TTFT.
@@ -77,9 +81,9 @@ Keep SWE-Bench and LongSWE-Bench results in separate output directories. `--insp
 
 ## Results
 
-See `summary.json` for `highest_passing_concurrency`, `confirmed_concurrency`, `smallest_observed_fail`, and per-stage metrics. A passing probe and a successful independent confirmation are reported separately; inconsistent PASS/FAIL observations are flagged. `requests.jsonl` contains individual request measurements; `config.json` records settings and dataset details.
+See `summary.json` for `highest_passing_concurrency`, `confirmed_concurrency`, `smallest_observed_fail`, `confirmation_target_requests`, `confirmation_completed`, `confirmation_status`, and per-stage metrics. A passing probe and a successful independent confirmation are reported separately; incomplete confirmation never produces a confirmed result, and inconsistent PASS/FAIL observations are flagged. Stages record `target_requests`, `request_target_met`, and `stop_reason`. `requests.jsonl` contains individual request measurements; `config.json` records settings and dataset details.
 
-Errors and insufficient samples do not count as passing. Results are observations within the send window, not proof of the global maximum or a full 20-minute run at one concurrency. Timing fields include `send_window_seconds`, `last_request_started_elapsed_s`, `final_drain_seconds`, and `elapsed_wall_seconds`.
+Errors and insufficient samples do not count as passing. Results are observations within the send window, not proof of the global maximum or a full 20-minute run at one concurrency. Timing fields include `send_window_seconds` (the configured cap), `last_request_started_elapsed_s`, `final_drain_seconds`, and `elapsed_wall_seconds`. Per-stage `admission_limit_seconds` is the available window; `admission_seconds` ends at the target/deadline and `drain_seconds` covers the remaining in-flight work.
 
 Run `python longswe_slo.py --help` for all options.
 
@@ -90,4 +94,5 @@ CPU-only tests use temporary local fixtures; no GPU or running SGLang server is 
 ```bash
 python -m unittest discover -v
 ```
+
 
