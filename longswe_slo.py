@@ -145,7 +145,7 @@ async def flush_cache(session, args):
 
 
 async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, deadline,
-                benchmark_start=None):
+                benchmark_start=None, request_limit=None):
     if time.perf_counter() >= deadline:
         return None
     if not args.keep_cache:
@@ -156,14 +156,19 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
         return None
     rows = []
     counter = 0
+    target_reached_at = None
     # Same shuffled order per stage across all server configurations.
     order = list(range(len(prompts)))
     random.Random(args.seed).shuffle(order)
     print(f'[{kind}] concurrency={c}, submit window={admission_end-start:.1f}s', flush=True)
 
     async def worker():
-        nonlocal counter
+        nonlocal counter, target_reached_at
         while time.perf_counter() < admission_end:
+            # Reserve one slot before yielding so concurrent workers cannot
+            # overshoot the shared request target. Failed requests are not retried.
+            if request_limit is not None and counter >= request_limit:
+                break
             seq = counter
             counter += 1
             sample = order[seq % len(order)]
@@ -173,6 +178,8 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Distinct FIRST tokens prevent repeated full-context cache hits.
                 salt = hashlib.sha256(rid.encode()).hexdigest()
                 prompt = f'<!-- benchmark-request {salt} -->\n' + prompt
+            if request_limit is not None and counter == request_limit:
+                target_reached_at = time.perf_counter()
             row = await request(session, args, prompt, rid,
                                 admission_deadline=admission_end,
                                 benchmark_start=benchmark_start)
@@ -187,14 +194,25 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Do not repeatedly hammer an invalid/failed endpoint.
                 return
 
-    # Stop admitting at admission_end, but never cancel requests at that boundary.
+    # Stop at the target or deadline, and drain every request already admitted.
     await asyncio.gather(*(worker() for _ in range(c)))
     finished_at = time.perf_counter()
+    stopped_at = min(admission_end, finished_at,
+                     target_reached_at if target_reached_at is not None else finished_at)
     result = summarize(rows, args)
+    target_met = result['completed'] == request_limit if request_limit is not None else None
+    if request_limit is not None and not target_met and result['status'] != 'ERROR':
+        result['status'] = 'INSUFFICIENT'
+        result['insufficient_reason'] = 'confirmation_request_target_not_reached'
+    stop_reason = ('request_error' if result['errors'] else
+                   'request_target_reached' if target_met else 'admission_deadline')
     result.update(kind=kind, concurrency=c,
-                  admission_seconds=admission_end-start,
+                  target_requests=request_limit, request_target_met=target_met,
+                  stop_reason=stop_reason,
+                  admission_seconds=stopped_at-start,
+                  admission_limit_seconds=admission_end-start,
                   wall_seconds=finished_at-start,
-                  drain_seconds=max(0.0, finished_at-admission_end),
+                  drain_seconds=max(0.0, finished_at-stopped_at),
                   last_request_started_elapsed_s=max(
                       (r.get('admitted_elapsed_s', 0.0) for r in rows), default=None))
     print(json.dumps(result, ensure_ascii=False), flush=True)
@@ -316,6 +334,7 @@ async def main_async(args, prompts, data_info):
         run_id = uuid.uuid4().hex
         low, high, candidate = 0, None, args.start_concurrency
         confirmed = None
+        confirmation = None
         stop_reason = 'budget_exhausted'
         with (out/'requests.jsonl').open('w', buffering=1) as raw:
             while True:
@@ -354,17 +373,20 @@ async def main_async(args, prompts, data_info):
             if stop_reason != 'invalid_probe_error':
                 remaining = deadline-time.perf_counter()
                 if remaining > 0:
-                    # Confirmation has no minimum duration. If no probe passed,
-                    # continue the last candidate rather than ending the run early.
+                    # Confirm a fixed workload, bounded by the remaining global
+                    # send window. A partial workload cannot confirm a candidate.
                     final_c = low or candidate
                     final_kind = 'confirm' if low else 'continue'
                     r = await stage(session, args, prompts, final_c, remaining,
                                     final_kind, raw, run_id, deadline,
-                                    benchmark_start=start)
+                                    benchmark_start=start,
+                                    request_limit=args.confirm_requests)
                     if r:
+                        confirmation = r
                         results.append(r)
                         (out/'stages.json').write_text(json.dumps(results, indent=2))
-                        if final_kind == 'confirm' and r['status'] == 'PASS':
+                        if (final_kind == 'confirm' and r['status'] == 'PASS'
+                                and r['completed'] == args.confirm_requests):
                             confirmed = low
         passed = {r['concurrency'] for r in results if r['status'] == 'PASS'}
         failed = {r['concurrency'] for r in results if r['status'] == 'FAIL'}
@@ -392,12 +414,15 @@ async def main_async(args, prompts, data_info):
                       inconsistent_concurrencies=inconsistent,
                       tested_upper_cap=args.max_concurrency,
                       status=status,
+                      confirmation_target_requests=args.confirm_requests,
+                      confirmation_completed=confirmation['completed'] if confirmation else None,
+                      confirmation_status=confirmation['status'] if confirmation else 'NOT_RUN',
                       stop_reason=stop_reason, budget_seconds=args.budget_seconds,
                       send_window_seconds=args.budget_seconds,
                       last_request_started_elapsed_s=max(last_starts) if last_starts else None,
                       final_drain_seconds=max(0.0, elapsed-args.budget_seconds),
                       elapsed_wall_seconds=elapsed,
-                      note='No new generation requests after the send-window deadline; in-flight requests drain afterward. Passing candidates are observed results, not proof of the global maximum.',
+                      note='Search probes are time-bounded; confirmation uses a fixed request target within the same global send window. No new generation requests after the deadline; in-flight requests drain afterward. Partial confirmation is insufficient. Passing candidates are observed results, not proof of the global maximum.',
                       stages=results)
         (out/'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print('\nSUMMARY\n'+json.dumps(report, indent=2, ensure_ascii=False), flush=True)
@@ -416,9 +441,10 @@ def parse_args(argv=None, *, dataset_kind='longswebench'):
     p.add_argument('--label', default='run')
     p.add_argument('--output-dir', required=True, help='Must not exist')
     p.add_argument('--output-len', type=int, required=True, help='Agree on this before comparing results; fixed output, ignore EOS')
-    p.add_argument('--budget-seconds', type=float, default=1200, help='Total send-window seconds after preparation and warmup; final draining is extra')
+    p.add_argument('--budget-seconds', type=float, default=1200, help='Maximum global send-window seconds after preparation and warmup; confirmation can finish early, final draining is extra')
     p.add_argument('--probe-seconds', type=float, default=180)
     p.add_argument('--confirm-seconds', type=float, default=300, help='Target time to reserve for confirmation; not a required minimum')
+    p.add_argument('--confirm-requests', type=int, default=100, help='Fixed request target for final confirmation; stop earlier at the global send deadline')
     p.add_argument('--request-timeout', type=float, default=300)
     p.add_argument('--start-concurrency', type=int, default=8)
     p.add_argument('--max-concurrency', type=int, default=64)
@@ -441,6 +467,8 @@ def parse_args(argv=None, *, dataset_kind='longswebench'):
         p.error('Require 1 <= start concurrency <= max concurrency')
     if a.output_len < 2 or a.min_completed < 1:
         p.error('Require output_len >= 2 and min_completed >= 1')
+    if a.confirm_requests < a.min_completed:
+        p.error('Require confirm-requests >= min-completed >= 1')
     for key in ('budget_seconds', 'probe_seconds', 'confirm_seconds', 'request_timeout', 'ttft_slo', 'tps_slo'):
         if getattr(a, key) <= 0:
             p.error(f'{key} must be positive')
@@ -457,4 +485,5 @@ def cli_main(argv=None, *, dataset_kind='longswebench'):
 
 if __name__ == '__main__':
     cli_main()
+
 

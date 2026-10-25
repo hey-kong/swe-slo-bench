@@ -165,6 +165,7 @@ class DatasetLoadingTests(unittest.TestCase):
         self.assertEqual((args.budget_seconds, args.start_concurrency, args.max_concurrency),
                          (1200, 8, 64))
         self.assertEqual((args.ttft_slo, args.tps_slo, args.output_len), (10, 15, 1024))
+        self.assertEqual(args.confirm_requests, 100)
         self.assertFalse(args.allow_prefix_reuse)
         self.assertFalse(args.keep_cache)
         self.assertEqual(prompts, ['issue plus code'])
@@ -198,3 +199,4 @@ class DatasetLoadingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
