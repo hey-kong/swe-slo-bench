@@ -144,6 +144,111 @@ async def flush_cache(session, args):
         raise RuntimeError(f'Cache flush rejected: {text[:300]}')
 
 
+async def confirmation_stage(session, args, prompts, c, kind, raw_file, run_id,
+                             start, admission_end, request_limit, benchmark_start):
+    """Score a fixed cohort while same-workload background traffic fills slots."""
+    order = list(range(len(prompts)))
+    random.Random(args.seed).shuffle(order)
+    rows = []
+    measured_assigned = measured_finished = warmup_completed = background_assigned = 0
+    measured_started_at = measured_finished_at = error_at = None
+    print(f'[{kind}] concurrency={c}, measured target={request_limit}, '
+          f'submit limit={admission_end-start:.1f}s, background refill enabled', flush=True)
+
+    async def worker(worker_id):
+        nonlocal measured_assigned, measured_finished, warmup_completed, background_assigned
+        nonlocal measured_started_at, measured_finished_at, error_at
+        first_request = True
+        while (time.perf_counter() < admission_end and error_at is None
+               and measured_finished_at is None):
+            # No await between cohort assignment and request initiation. Early
+            # warmup finishers refill too, instead of waiting at an idle barrier.
+            if first_request:
+                role, index, source_index = 'warmup', worker_id, worker_id
+                first_request = False
+            elif warmup_completed == c and measured_assigned < request_limit:
+                role = 'measured'
+                index = source_index = measured_assigned
+                measured_assigned += 1
+                if measured_started_at is None:
+                    measured_started_at = time.perf_counter()
+            else:
+                role, index = 'background', background_assigned
+                source_index = request_limit + background_assigned
+                background_assigned += 1
+            sample = order[source_index % len(order)]
+            rid = f'{run_id}-{kind}-{c}-{role}-{index}'
+            prompt = prompts[sample]
+            if not args.allow_prefix_reuse:
+                salt = hashlib.sha256(rid.encode()).hexdigest()
+                prompt = f'<!-- benchmark-request {salt} -->\n' + prompt
+            row = await request(session, args, prompt, rid,
+                                admission_deadline=admission_end,
+                                benchmark_start=benchmark_start)
+            if row is None:
+                break
+            finished_at = time.perf_counter()
+            row.update(kind=kind, concurrency=c, sample_index=sample,
+                       measurement_role=role, request_index=index,
+                       stage_elapsed_s=finished_at-start)
+            rows.append(row)
+            if not row['ok'] and error_at is None:
+                error_at = finished_at
+            if role == 'warmup' and row['ok']:
+                warmup_completed += 1
+            elif role == 'measured':
+                measured_finished += 1
+                if measured_finished == request_limit:
+                    measured_finished_at = finished_at
+            raw_file.write(json.dumps(row, ensure_ascii=False)+'\n')
+            raw_file.flush()
+
+    # Once the cohort is done (or the deadline/error occurs), no worker refills.
+    # Pending background and measured requests finish normally and remain logged.
+    await asyncio.gather(*(worker(index) for index in range(c)))
+    finished_at = time.perf_counter()
+    stopped_at = min(value for value in
+                     (admission_end, finished_at, measured_finished_at, error_at)
+                     if value is not None)
+    measured = [row for row in rows if row['measurement_role'] == 'measured']
+    warmup = [row for row in rows if row['measurement_role'] == 'warmup']
+    background = [row for row in rows if row['measurement_role'] == 'background']
+    errors = [row for row in rows if not row['ok']]
+    result = summarize(measured, args)
+    target_met = result['completed'] == request_limit
+    steady_state_valid = (target_met and warmup_completed == c and not errors
+                          and measured_finished_at is not None
+                          and measured_finished_at < admission_end)
+    if errors:
+        result['status'] = 'ERROR'
+        result['error_examples'] = [row.get('error') for row in errors][:3]
+    elif not steady_state_valid:
+        result['status'] = 'INSUFFICIENT'
+        result['insufficient_reason'] = 'cohort_not_completed_under_load_before_deadline'
+    result.update(
+        kind=kind, concurrency=c, target_requests=request_limit,
+        request_target_met=target_met, steady_state_valid=steady_state_valid,
+        measured_assigned=measured_assigned,
+        warmup_sent=len(warmup), warmup_completed=warmup_completed,
+        background_sent=len(background), total_sent=len(rows),
+        load_errors=sum(not row['ok'] for row in warmup + background),
+        total_errors=len(errors),
+        stop_reason=('request_error' if errors else 'request_target_reached'
+                     if steady_state_valid else 'admission_deadline'),
+        measurement_start_seconds=(measured_started_at-start
+                                   if measured_started_at is not None else None),
+        measurement_end_seconds=(measured_finished_at-start
+                                 if measured_finished_at is not None else None),
+        admission_seconds=stopped_at-start,
+        admission_limit_seconds=admission_end-start,
+        wall_seconds=finished_at-start,
+        drain_seconds=max(0.0, finished_at-stopped_at),
+        last_request_started_elapsed_s=max(
+            (row.get('admitted_elapsed_s', 0.0) for row in rows), default=None))
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return result
+
+
 async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, deadline,
                 benchmark_start=None, request_limit=None):
     if time.perf_counter() >= deadline:
@@ -154,21 +259,20 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
     admission_end = min(start + seconds, deadline)
     if admission_end <= start:
         return None
+    if request_limit is not None:
+        return await confirmation_stage(
+            session, args, prompts, c, kind, raw_file, run_id, start,
+            admission_end, request_limit, benchmark_start)
     rows = []
     counter = 0
-    target_reached_at = None
     # Same shuffled order per stage across all server configurations.
     order = list(range(len(prompts)))
     random.Random(args.seed).shuffle(order)
     print(f'[{kind}] concurrency={c}, submit window={admission_end-start:.1f}s', flush=True)
 
     async def worker():
-        nonlocal counter, target_reached_at
+        nonlocal counter
         while time.perf_counter() < admission_end:
-            # Reserve one slot before yielding so concurrent workers cannot
-            # overshoot the shared request target. Failed requests are not retried.
-            if request_limit is not None and counter >= request_limit:
-                break
             seq = counter
             counter += 1
             sample = order[seq % len(order)]
@@ -178,14 +282,13 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Distinct FIRST tokens prevent repeated full-context cache hits.
                 salt = hashlib.sha256(rid.encode()).hexdigest()
                 prompt = f'<!-- benchmark-request {salt} -->\n' + prompt
-            if request_limit is not None and counter == request_limit:
-                target_reached_at = time.perf_counter()
             row = await request(session, args, prompt, rid,
                                 admission_deadline=admission_end,
                                 benchmark_start=benchmark_start)
             if row is None:
                 break
             row.update(kind=kind, concurrency=c, sample_index=sample,
+                       measurement_role='probe', request_index=seq,
                        stage_elapsed_s=time.perf_counter()-start)
             rows.append(row)
             raw_file.write(json.dumps(row, ensure_ascii=False)+'\n')
@@ -194,20 +297,15 @@ async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, dead
                 # Do not repeatedly hammer an invalid/failed endpoint.
                 return
 
-    # Stop at the target or deadline, and drain every request already admitted.
+    # Time-based probes stop at their deadline and drain admitted requests.
     await asyncio.gather(*(worker() for _ in range(c)))
     finished_at = time.perf_counter()
-    stopped_at = min(admission_end, finished_at,
-                     target_reached_at if target_reached_at is not None else finished_at)
+    stopped_at = min(admission_end, finished_at)
     result = summarize(rows, args)
-    target_met = result['completed'] == request_limit if request_limit is not None else None
-    if request_limit is not None and not target_met and result['status'] != 'ERROR':
-        result['status'] = 'INSUFFICIENT'
-        result['insufficient_reason'] = 'confirmation_request_target_not_reached'
-    stop_reason = ('request_error' if result['errors'] else
-                   'request_target_reached' if target_met else 'admission_deadline')
+    stop_reason = 'request_error' if result['errors'] else 'admission_deadline'
     result.update(kind=kind, concurrency=c,
-                  target_requests=request_limit, request_target_met=target_met,
+                  target_requests=None, request_target_met=None,
+                  steady_state_valid=None,
                   stop_reason=stop_reason,
                   admission_seconds=stopped_at-start,
                   admission_limit_seconds=admission_end-start,
@@ -315,6 +413,7 @@ async def main_async(args, prompts, data_info):
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=False)
     settings = vars(args).copy()
+    settings['confirmation_mode'] = 'scored_cohort_with_background'
     (out/'config.json').write_text(json.dumps(dict(settings=settings, data=data_info), indent=2, ensure_ascii=False))
     headers = {}
     if os.environ.get('SGLANG_API_KEY'):
@@ -386,6 +485,7 @@ async def main_async(args, prompts, data_info):
                         results.append(r)
                         (out/'stages.json').write_text(json.dumps(results, indent=2))
                         if (final_kind == 'confirm' and r['status'] == 'PASS'
+                                and r['steady_state_valid']
                                 and r['completed'] == args.confirm_requests):
                             confirmed = low
         passed = {r['concurrency'] for r in results if r['status'] == 'PASS'}
@@ -415,14 +515,19 @@ async def main_async(args, prompts, data_info):
                       tested_upper_cap=args.max_concurrency,
                       status=status,
                       confirmation_target_requests=args.confirm_requests,
+                      confirmation_mode='scored_cohort_with_background',
                       confirmation_completed=confirmation['completed'] if confirmation else None,
                       confirmation_status=confirmation['status'] if confirmation else 'NOT_RUN',
+                      confirmation_steady_state_valid=(confirmation.get('steady_state_valid')
+                                                       if confirmation else None),
+                      confirmation_total_sent=confirmation.get('total_sent') if confirmation else None,
+                      confirmation_background_sent=confirmation.get('background_sent') if confirmation else None,
                       stop_reason=stop_reason, budget_seconds=args.budget_seconds,
                       send_window_seconds=args.budget_seconds,
                       last_request_started_elapsed_s=max(last_starts) if last_starts else None,
                       final_drain_seconds=max(0.0, elapsed-args.budget_seconds),
                       elapsed_wall_seconds=elapsed,
-                      note='Search probes are time-bounded; confirmation uses a fixed request target within the same global send window. No new generation requests after the deadline; in-flight requests drain afterward. Partial confirmation is insufficient. Passing candidates are observed results, not proof of the global maximum.',
+                      note='Search probes are time-bounded. Confirmation scores a fixed cohort after concurrent warmup, with same-workload background refill until all scored requests finish or the global deadline. All traffic is logged; only scored requests enter SLO metrics. A cohort finishing after the deadline or any load error cannot confirm a candidate. Pending requests drain normally. Passing candidates are observations, not proof of the global maximum.',
                       stages=results)
         (out/'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print('\nSUMMARY\n'+json.dumps(report, indent=2, ensure_ascii=False), flush=True)
@@ -444,7 +549,7 @@ def parse_args(argv=None, *, dataset_kind='longswebench'):
     p.add_argument('--budget-seconds', type=float, default=1200, help='Maximum global send-window seconds after preparation and warmup; confirmation can finish early, final draining is extra')
     p.add_argument('--probe-seconds', type=float, default=180)
     p.add_argument('--confirm-seconds', type=float, default=300, help='Target time to reserve for confirmation; not a required minimum')
-    p.add_argument('--confirm-requests', type=int, default=100, help='Fixed request target for final confirmation; stop earlier at the global send deadline')
+    p.add_argument('--confirm-requests', type=int, default=100, help='Scored requests in final confirmation; background refill maintains load until all finish or the global send deadline')
     p.add_argument('--request-timeout', type=float, default=300)
     p.add_argument('--start-concurrency', type=int, default=8)
     p.add_argument('--max-concurrency', type=int, default=64)
@@ -485,5 +590,6 @@ def cli_main(argv=None, *, dataset_kind='longswebench'):
 
 if __name__ == '__main__':
     cli_main()
+
 
 

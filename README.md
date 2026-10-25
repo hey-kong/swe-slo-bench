@@ -69,10 +69,11 @@ Keep SWE-Bench and LongSWE-Bench results in separate output directories. `--insp
 
 ## Test settings
 
-- Search uses fixed-time probes; final confirmation targets the same **100 requests** by default (`--confirm-requests`). Every stage starts from the same seeded prompt order, so complete confirmations use the same source samples across configurations. This target applies to the final confirmation/continuation stage, not each search probe or the whole run.
-- A **1,200-second maximum global send window** starts after local data preparation and warmup. Search, cache flushes, inter-stage draining, and confirmation share this budget. Confirmation stops admitting when it reaches 100 requests or the global deadline, whichever comes first. All admitted requests drain normally; wall time can exceed 20 minutes. A complete confirmation may finish earlier than 20 minutes.
+- Search uses fixed-time probes. Final confirmation scores a preassigned cohort of **100 requests** by default (`--confirm-requests`), with the same seeded source-sample order across configurations. These are not the first 100 completions: every scored request, including the slowest, must finish.
+- Confirmation first completes one full-workload warmup request per client worker. Early finishers send background requests while the remaining warmups finish. Workers then send scored requests and, after the cohort is fully assigned, continue same-workload background requests to maintain the requested client concurrency until the entire cohort finishes. Warmup/background traffic uses the same output length, sampling and cache policy; none enters the SLO metrics. Total traffic can exceed 100 requests.
+- A **1,200-second maximum global send window** starts after data preparation and the basic endpoint warmup. Search, cache flushes, inter-stage draining, concurrent workload warmup, and confirmation share this budget. All new traffic stops when the cohort finishes or the deadline arrives. Pending requests drain normally and remain logged, so wall time can exceed 20 minutes. A complete confirmation may finish early.
 - Concurrency starts at 8 and is capped at 64. Doubling and binary search use 180-second probes; `--confirm-seconds` reserves a target amount of remaining time, not an extra window or required minimum. If no probe passed, the final stage continues the last candidate with the same request target.
-- Confirmation requires all target requests to complete successfully and meet the SLO; a partial workload is `INSUFFICIENT` even if its observed metrics pass. Errors remain `ERROR` and are not replaced with extra requests. `--min-completed` (default 20) is a sample gate, not a request-count stopping rule; `--confirm-requests` must be at least this value.
+- Confirmation requires the whole cohort to finish successfully **before** the deadline under maintained load and meet the SLO. A late/partial cohort is `INSUFFICIENT`, even if all 100 eventually finish with passing metrics during draining. No late scored requests are selectively removed. Errors in any confirmation traffic invalidate the stage and are not replaced. `--min-completed` (default 20) is a sample gate, not a stopping rule; `--confirm-requests` must be at least this value.
 - Requests drain completely between stages without resetting the global clock. Errors stop the run early; existing per-request timeouts still apply. The former `--drain-reserve` option has been removed.
 - Fixed output length, temperature 0, and EOS ignored. Keep output length identical across configurations.
 - Mean decode TPS is the arithmetic mean of `(output_tokens - 1) / (E2E - TTFT)` per request, excluding TTFT.
@@ -81,9 +82,11 @@ Keep SWE-Bench and LongSWE-Bench results in separate output directories. `--insp
 
 ## Results
 
-See `summary.json` for `highest_passing_concurrency`, `confirmed_concurrency`, `smallest_observed_fail`, `confirmation_target_requests`, `confirmation_completed`, `confirmation_status`, and per-stage metrics. A passing probe and a successful independent confirmation are reported separately; incomplete confirmation never produces a confirmed result, and inconsistent PASS/FAIL observations are flagged. Stages record `target_requests`, `request_target_met`, and `stop_reason`. `requests.jsonl` contains individual request measurements; `config.json` records settings and dataset details.
+See `summary.json` for `highest_passing_concurrency`, `confirmed_concurrency`, `smallest_observed_fail`, `confirmation_target_requests`, `confirmation_completed`, `confirmation_status`, `confirmation_steady_state_valid`, and per-stage metrics. Use the independent confirmation for sustained-load conclusions; time-based search probes may include startup/drain effects. Inconsistent PASS/FAIL observations remain flagged.
 
-Errors and insufficient samples do not count as passing. Results are observations within the send window, not proof of the global maximum or a full 20-minute run at one concurrency. Timing fields include `send_window_seconds` (the configured cap), `last_request_started_elapsed_s`, `final_drain_seconds`, and `elapsed_wall_seconds`. Per-stage `admission_limit_seconds` is the available window; `admission_seconds` ends at the target/deadline and `drain_seconds` covers the remaining in-flight work.
+Every request in `requests.jsonl` has `measurement_role` (`probe`, `warmup`, `measured`, or `background`), `request_index`, and `sample_index`. For confirmation stages, `sent`, `completed`, `errors`, and all SLO metrics describe only the scored cohort. `total_sent`, `warmup_sent`, `background_sent`, `load_errors`, and `total_errors` account for all traffic, including draining. `request_target_met` only checks the successful scored count; `steady_state_valid` also requires timely cohort completion and error-free support traffic. This validates the maintained-load procedure, not latency convergence or a constant GPU decode batch size. Configuration records `confirmation_mode=scored_cohort_with_background`.
+
+Errors and insufficient samples do not count as passing. Results are observations within the send window, not proof of the global maximum or a full 20-minute run at one concurrency. Timing fields include `send_window_seconds` (the cap), `last_request_started_elapsed_s` (all traffic), `final_drain_seconds`, and `elapsed_wall_seconds`. Per-stage `admission_limit_seconds` is the available window; `admission_seconds` ends when the whole cohort finishes or admission stops, and `drain_seconds` covers remaining in-flight work. `measurement_start_seconds`/`measurement_end_seconds` locate the scored cohort within confirmation, excluding its preceding workload warmup.
 
 Run `python longswe_slo.py --help` for all options.
 
@@ -94,5 +97,6 @@ CPU-only tests use temporary local fixtures; no GPU or running SGLang server is 
 ```bash
 python -m unittest discover -v
 ```
+
 
 

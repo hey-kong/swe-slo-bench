@@ -150,7 +150,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request_limit, 100)
                 clock.advance(seconds + 2)  # Drain ends after the global deadline.
             return dict(kind=kind, concurrency=c, status='PASS',
-                        completed=request_limit or 1,
+                        completed=request_limit or 1, steady_state_valid=bool(request_limit),
                         last_request_started_elapsed_s=clock.read()-2.1)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,7 +172,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             kinds.append(kind)
             clock.advance(5 if kind == 'probe' else seconds)
             return dict(kind=kind, concurrency=c,
-                        completed=request_limit or 1,
+                        completed=request_limit or 1, steady_state_valid=bool(request_limit),
                         status='INSUFFICIENT' if kind == 'probe' else 'PASS',
                         last_request_started_elapsed_s=clock.read()-.1)
 
@@ -195,7 +195,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
                 probes.append(c)
             clock.advance(seconds)
             return dict(kind=kind, concurrency=c, status=outcomes[c],
-                        completed=request_limit or 1,
+                        completed=request_limit or 1, steady_state_valid=bool(request_limit),
                         last_request_started_elapsed_s=clock.read()-.1)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,7 +214,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
                         deadline, benchmark_start=None, request_limit=None):
             clock.advance(seconds)
             return dict(kind=kind, concurrency=c,
-                        completed=request_limit or 1,
+                        completed=request_limit or 1, steady_state_valid=bool(request_limit),
                         status='PASS' if kind == 'probe' else 'FAIL',
                         last_request_started_elapsed_s=clock.read()-.1)
 
@@ -351,4 +351,5 @@ class CacheFlushTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

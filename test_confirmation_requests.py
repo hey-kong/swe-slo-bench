@@ -18,7 +18,7 @@ import test_longswe_slo as fixture
 
 
 class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_exactly_100_requests_with_shared_slots_and_identical_source_order(self):
+    async def test_exactly_100_scored_requests_with_shared_slots_and_identical_source_order(self):
         orders = []
         for concurrency in (1, 7, 64, 128):
             with self.subTest(concurrency=concurrency):
@@ -49,14 +49,17 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
                         concurrency, 100, 'confirm', raw, 'run', 100,
                         request_limit=100,
                     )
-                self.assertEqual(len(calls), 100)
-                self.assertEqual(len(set(calls)), 100)
-                self.assertEqual(maximum, min(concurrency, 100))
+                self.assertGreaterEqual(len(calls), 100 + concurrency)
+                self.assertEqual(len(set(calls)), len(calls))
+                self.assertEqual(maximum, concurrency)
                 self.assertEqual(result['completed'], 100)
                 self.assertTrue(result['request_target_met'])
+                self.assertTrue(result['steady_state_valid'])
                 self.assertEqual(result['status'], 'PASS')
-                rows = sorted((json.loads(line) for line in raw.getvalue().splitlines()),
+                rows = sorted((row for line in raw.getvalue().splitlines()
+                               if (row := json.loads(line))['measurement_role'] == 'measured'),
                               key=lambda row: int(row['rid'].rsplit('-', 1)[1]))
+                self.assertEqual(len(rows), 100)
                 orders.append([row['sample_index'] for row in rows])
         self.assertTrue(all(order == orders[0] for order in orders))
 
@@ -83,20 +86,20 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
             )
         return result, starts
 
-    async def test_target_stops_early_and_drains_last_request(self):
+    async def test_target_stops_after_cohort_completion_without_filling_time_cap(self):
         result, starts = await self.timed_stage(target=3, deadline=100)
-        self.assertEqual(starts, [0, 4, 8])
+        self.assertEqual(starts, [0, 4, 8, 12])
         self.assertEqual(result['status'], 'PASS')
         self.assertEqual(result['stop_reason'], 'request_target_reached')
-        self.assertEqual(result['wall_seconds'], 12)
-        self.assertEqual(result['admission_seconds'], 8)
+        self.assertEqual(result['wall_seconds'], 16)
+        self.assertEqual(result['admission_seconds'], 16)
         self.assertEqual(result['admission_limit_seconds'], 100)
-        self.assertEqual(result['drain_seconds'], 4)
+        self.assertEqual(result['drain_seconds'], 0)
 
     async def test_partial_target_is_insufficient_even_with_passing_metrics(self):
         result, starts = await self.timed_stage(target=100, deadline=10)
         self.assertEqual(starts, [0, 4, 8])
-        self.assertEqual(result['completed'], 3)
+        self.assertEqual(result['completed'], 2)
         self.assertLess(result['p90_ttft_s'], 10)
         self.assertGreater(result['mean_decode_tps'], 15)
         self.assertEqual(result['status'], 'INSUFFICIENT')
@@ -104,15 +107,16 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['stop_reason'], 'admission_deadline')
         self.assertEqual(result['drain_seconds'], 2)
 
-    async def test_full_target_can_complete_after_the_send_deadline(self):
-        result, starts = await self.timed_stage(target=3, deadline=10)
-        self.assertTrue(all(start < 10 for start in starts))
-        self.assertEqual(result['wall_seconds'], 12)
+    async def test_full_target_after_deadline_is_insufficient_despite_normal_drain(self):
+        result, starts = await self.timed_stage(target=3, deadline=14)
+        self.assertTrue(all(start < 14 for start in starts))
+        self.assertEqual(result['wall_seconds'], 16)
         self.assertTrue(result['request_target_met'])
-        self.assertEqual(result['status'], 'PASS')
+        self.assertFalse(result['steady_state_valid'])
+        self.assertEqual(result['status'], 'INSUFFICIENT')
 
     async def test_failed_requests_are_not_replaced_to_reach_the_target(self):
-        generate = AsyncMock(return_value=dict(ok=False, error='server error'))
+        generate = AsyncMock(side_effect=[fixture.row(), dict(ok=False, error='server error')])
         with (
             patch.object(bench, 'request', generate),
             contextlib.redirect_stdout(io.StringIO()),
@@ -122,7 +126,7 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 'confirm', io.StringIO(), 'run', time.perf_counter() + 60,
                 request_limit=100,
             )
-        generate.assert_awaited_once()
+        self.assertEqual(generate.await_count, 2)  # One warmup, one failed scored request.
         self.assertEqual(result['status'], 'ERROR')
         self.assertEqual(result['errors'], 1)
         self.assertFalse(result['request_target_met'])
@@ -132,7 +136,7 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(changed=changed):
                 row = {**fixture.row(), **changed}
                 with (
-                    patch.object(bench, 'request', new=AsyncMock(return_value=row)),
+                    patch.object(bench, 'request', new=AsyncMock(side_effect=lambda *a, **kw: dict(row))),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     result = await bench.stage(
@@ -154,6 +158,7 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
             clock.advance(seconds if kind == 'probe' or not complete else 1)
             return dict(kind=kind, concurrency=c,
                         status='PASS' if kind == 'probe' or complete else 'INSUFFICIENT',
+                        steady_state_valid=bool(request_limit and complete),
                         completed=(request_limit if complete else 30) if request_limit else 20,
                         last_request_started_elapsed_s=clock.read() - .1)
 
@@ -189,7 +194,7 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['confirmation_status'], 'PASS')
         self.assertLess(report['elapsed_wall_seconds'], report['send_window_seconds'])
 
-    async def test_actual_http_streams_stop_at_100_requests(self):
+    async def test_actual_http_streams_score_100_and_log_all_support_traffic(self):
         received = []
 
         async def generate(request):
@@ -213,8 +218,10 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
                     session, args, ['prompt'], 7, 60, 'confirm', io.StringIO(),
                     'http', time.perf_counter() + 60, request_limit=100,
                 )
-        self.assertEqual(len(received), 100)
-        self.assertEqual(len(set(received)), 100)
+        self.assertGreaterEqual(len(received), 107)
+        self.assertEqual(len(set(received)), len(received))
+        self.assertEqual(sum('-measured-' in rid for rid in received), 100)
+        self.assertEqual(result['total_sent'], len(received))
         self.assertEqual(result['status'], 'PASS')
         self.assertEqual(result['completed'], 100)
 
@@ -236,3 +243,4 @@ class ConfirmationOptionsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
