@@ -43,6 +43,7 @@ def summarize(rows, args):
         status = 'FAIL'
     return dict(status=status, completed=len(ok), sent=len(rows),
                 errors=len(rows)-len(ok), p90_ttft_s=p90, mean_decode_tps=mean,
+                mean_ttft_s=statistics.mean(ttfts) if ttfts else None,
                 p90_e2e_s=percentile([r['e2e_s'] for r in ok], .9),
                 mean_e2e_tps=statistics.mean([r['e2e_tps'] for r in ok]) if ok else None,
                 mean_cached_tokens=statistics.mean([r.get('cached_tokens', 0) for r in ok]) if ok else None,
@@ -142,6 +143,58 @@ async def flush_cache(session, args):
         value = text
     if value is False or (isinstance(value, dict) and value.get('success') is False):
         raise RuntimeError(f'Cache flush rejected: {text[:300]}')
+
+
+async def warmup_workload(session, args, prompts, c, kind, raw_file, run_id,
+                          deadline, benchmark_start):
+    """One fixed full-workload wave; failures abort, slow successes are retained."""
+    if time.perf_counter() >= deadline:
+        return None
+    if not args.keep_cache:
+        await flush_cache(session, args)
+    start = time.perf_counter()
+    if start >= deadline:
+        return None
+    order = list(range(len(prompts)))
+    random.Random(args.seed).shuffle(order)
+    rows = []
+    print(f'[warmup before {kind}] concurrency={c}, requests={c}, '
+          f'output_tokens={args.output_len}', flush=True)
+
+    async def one(index):
+        sample = order[index % len(order)]
+        rid = f'{run_id}-warmup-{kind}-{c}-{index}'
+        prompt = prompts[sample]
+        if not args.allow_prefix_reuse:
+            salt = hashlib.sha256(rid.encode()).hexdigest()
+            prompt = f'<!-- benchmark-request {salt} -->\n' + prompt
+        row = await request(session, args, prompt, rid,
+                            admission_deadline=deadline,
+                            benchmark_start=benchmark_start)
+        if row is None:
+            return
+        row = dict(row)
+        row.update(kind='warmup', for_stage=kind, concurrency=c,
+                   sample_index=sample, warmup_request_index=index,
+                   stage_elapsed_s=time.perf_counter()-start)
+        rows.append(row)
+        raw_file.write(json.dumps(row, ensure_ascii=False)+'\n')
+        raw_file.flush()
+
+    # Exactly one request per slot, with no refilling or background requests.
+    await asyncio.gather(*(one(index) for index in range(c)))
+    finished = time.perf_counter()
+    result = summarize(rows, args)
+    result.update(kind='warmup', for_stage=kind, concurrency=c,
+                  target_requests=c, output_len=args.output_len,
+                  status=('ERROR' if result['errors'] else 'COMPLETE'
+                          if result['completed'] == c else 'INSUFFICIENT'),
+                  wall_seconds=finished-start,
+                  finished_before_deadline=finished < deadline,
+                  last_request_started_elapsed_s=max(
+                      (r.get('admitted_elapsed_s', 0.0) for r in rows), default=None))
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return result
 
 
 async def stage(session, args, prompts, c, seconds, kind, raw_file, run_id, deadline,
@@ -325,26 +378,49 @@ async def main_async(args, prompts, data_info):
         async with session.get(args.base_url+'/health') as response:
             if response.status != 200:
                 raise RuntimeError(f'Server health failed: {response.status}')
-        warm = await request(session, args, 'Write a short Python comment.', 'warmup-'+uuid.uuid4().hex, 8)
-        if not warm['ok']:
-            raise RuntimeError(f'Warmup failed: {warm}')
         start = time.perf_counter()
         deadline = start + args.budget_seconds
         results = []
+        warmups = []
+        (out/'warmup_stages.json').write_text('[]')
+        warmup_stop_reason = None
         run_id = uuid.uuid4().hex
         low, high, candidate = 0, None, args.start_concurrency
         confirmed = None
         confirmation = None
         stop_reason = 'budget_exhausted'
-        with (out/'requests.jsonl').open('w', buffering=1) as raw:
+        with ((out/'requests.jsonl').open('w', buffering=1) as raw,
+              (out/'warmup_requests.jsonl').open('w', buffering=1) as warm_raw):
+            async def measured_stage(c, seconds, kind, request_limit=None):
+                nonlocal warmup_stop_reason
+                if args.workload_warmup:
+                    w = await warmup_workload(
+                        session, args, prompts, c, kind, warm_raw, run_id,
+                        deadline, start)
+                    if w is not None:
+                        warmups.append(w)
+                        (out/'warmup_stages.json').write_text(json.dumps(warmups, indent=2))
+                    if w is None or w['status'] != 'COMPLETE':
+                        warmup_stop_reason = ('invalid_warmup_error'
+                                              if w and w['status'] == 'ERROR'
+                                              else 'warmup_budget_exhausted')
+                        return None
+                    if time.perf_counter() >= deadline:
+                        warmup_stop_reason = 'warmup_budget_exhausted'
+                        return None
+                # stage() drains and flushes as before, so warming the runtime
+                # does not silently turn a cold-prefix test into cache reuse.
+                return await stage(session, args, prompts, c, seconds, kind, raw,
+                                   run_id, deadline, benchmark_start=start,
+                                   request_limit=request_limit)
+
             while True:
                 remaining = deadline-time.perf_counter()
                 # Reserve a target confirmation window, not time for final draining.
                 # Each probe drains before the next stage, within the send-window clock.
                 if remaining < args.confirm_seconds + args.probe_seconds:
                     break
-                r = await stage(session, args, prompts, candidate, args.probe_seconds,
-                                'probe', raw, run_id, deadline, benchmark_start=start)
+                r = await measured_stage(candidate, args.probe_seconds, 'probe')
                 if r is None:
                     break
                 results.append(r)
@@ -370,17 +446,15 @@ async def main_async(args, prompts, data_info):
                     candidate = (low+high)//2
                 else:
                     candidate = min(args.max_concurrency, candidate*2)
-            if stop_reason != 'invalid_probe_error':
+            if stop_reason != 'invalid_probe_error' and warmup_stop_reason is None:
                 remaining = deadline-time.perf_counter()
                 if remaining > 0:
                     # Confirm a fixed workload, bounded by the remaining global
                     # send window. A partial workload cannot confirm a candidate.
                     final_c = low or candidate
                     final_kind = 'confirm' if low else 'continue'
-                    r = await stage(session, args, prompts, final_c, remaining,
-                                    final_kind, raw, run_id, deadline,
-                                    benchmark_start=start,
-                                    request_limit=args.confirm_requests)
+                    r = await measured_stage(final_c, remaining, final_kind,
+                                             request_limit=args.confirm_requests)
                     if r:
                         confirmation = r
                         results.append(r)
@@ -391,7 +465,9 @@ async def main_async(args, prompts, data_info):
         passed = {r['concurrency'] for r in results if r['status'] == 'PASS'}
         failed = {r['concurrency'] for r in results if r['status'] == 'FAIL'}
         inconsistent = sorted(passed & failed)
-        has_errors = any(r['status'] == 'ERROR' for r in results)
+        if warmup_stop_reason is not None:
+            stop_reason = warmup_stop_reason
+        has_errors = any(r['status'] == 'ERROR' for r in results + warmups)
         if inconsistent:
             confirmed = None
             status = 'INCONSISTENT'
@@ -405,7 +481,7 @@ async def main_async(args, prompts, data_info):
         else:
             status = 'INCONCLUSIVE'
         elapsed = time.perf_counter()-start
-        last_starts = [r['last_request_started_elapsed_s'] for r in results
+        last_starts = [r['last_request_started_elapsed_s'] for r in results + warmups
                        if r.get('last_request_started_elapsed_s') is not None]
         report = dict(label=args.label, best_probe_concurrency=low or None,
                       highest_passing_concurrency=max(passed) if passed else None,
@@ -417,12 +493,20 @@ async def main_async(args, prompts, data_info):
                       confirmation_target_requests=args.confirm_requests,
                       confirmation_completed=confirmation['completed'] if confirmation else None,
                       confirmation_status=confirmation['status'] if confirmation else 'NOT_RUN',
+                      workload_warmup=args.workload_warmup,
+                      warmup_status=('DISABLED' if not args.workload_warmup else
+                                     'ERROR' if any(w['status'] == 'ERROR' for w in warmups) else
+                                     'INSUFFICIENT' if warmup_stop_reason else
+                                     'COMPLETE' if warmups else 'NOT_RUN'),
+                      warmup_sent=sum(w['sent'] for w in warmups),
+                      warmup_completed=sum(w['completed'] for w in warmups),
+                      warmup_stages=warmups,
                       stop_reason=stop_reason, budget_seconds=args.budget_seconds,
                       send_window_seconds=args.budget_seconds,
                       last_request_started_elapsed_s=max(last_starts) if last_starts else None,
                       final_drain_seconds=max(0.0, elapsed-args.budget_seconds),
                       elapsed_wall_seconds=elapsed,
-                      note='Search probes are time-bounded; confirmation uses a fixed request target within the same global send window. No new generation requests after the deadline; in-flight requests drain afterward. Partial confirmation is insufficient. Passing candidates are observed results, not proof of the global maximum.',
+                      note='When enabled, full-workload warmups are logged separately and share the global send budget; they do not count toward SLO statistics or the confirmation target. Search probes are time-bounded; confirmation uses a fixed request target within the same global send window. No new generation requests after the deadline; in-flight requests drain afterward. Partial confirmation is insufficient. Passing candidates are observed results, not proof of the global maximum.',
                       stages=results)
         (out/'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False))
         print('\nSUMMARY\n'+json.dumps(report, indent=2, ensure_ascii=False), flush=True)
@@ -441,7 +525,9 @@ def parse_args(argv=None, *, dataset_kind='longswebench'):
     p.add_argument('--label', default='run')
     p.add_argument('--output-dir', required=True, help='Must not exist')
     p.add_argument('--output-len', type=int, required=True, help='Agree on this before comparing results; fixed output, ignore EOS')
-    p.add_argument('--budget-seconds', type=float, default=1200, help='Maximum global send-window seconds after preparation and warmup; confirmation can finish early, final draining is extra')
+    p.add_argument('--budget-seconds', type=float, default=1200, help='Maximum global send-window seconds including workload warmups, search, and confirmation; final draining is extra')
+    p.add_argument('--no-workload-warmup', dest='workload_warmup', action='store_false',
+                   help='Disable full-workload warmup waves to measure first-use behavior')
     p.add_argument('--probe-seconds', type=float, default=180)
     p.add_argument('--confirm-seconds', type=float, default=300, help='Target time to reserve for confirmation; not a required minimum')
     p.add_argument('--confirm-requests', type=int, default=100, help='Fixed request target for final confirmation; stop earlier at the global send deadline')
@@ -485,5 +571,6 @@ def cli_main(argv=None, *, dataset_kind='longswebench'):
 
 if __name__ == '__main__':
     cli_main()
+
 
 

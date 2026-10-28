@@ -53,7 +53,7 @@ def options(output_dir='unused', **overrides):
         request_timeout=300, min_completed=1, ttft_slo=10, tps_slo=15,
         budget_seconds=10, probe_seconds=4, confirm_seconds=3,
         start_concurrency=8, max_concurrency=64, label='test', confirm_requests=100,
-        keep_cache=False, seed=42, allow_prefix_reuse=False,
+        keep_cache=False, seed=42, allow_prefix_reuse=False, workload_warmup=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -351,4 +351,5 @@ class CacheFlushTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 
